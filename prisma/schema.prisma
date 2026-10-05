@@ -1,0 +1,82 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id     Int     @id @default(autoincrement())
+  name   String
+  orders Order[]
+
+  @@map("users")
+}
+
+model Order {
+  id         Int      @id @default(autoincrement())
+  customerId Int
+  total      Decimal
+  status     Status   @default(PENDING)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt()
+
+  user       User        @relation(fields: [customerId], references: [id])
+  orderItems OrderItem[]
+
+  @@map("orders")
+}
+
+model Product {
+  id         Int         @id @default(autoincrement())
+  name       String
+  price      Decimal
+  orderItems OrderItem[]
+
+  @@map("products")
+}
+
+model OrderItem {
+  id        Int     @id @default(autoincrement())
+  orderId   Int
+  productId Int
+  quantity  Int
+  unitPrice Decimal
+
+  order   Order   @relation(fields: [orderId], references: [id])
+  product Product @relation(fields: [productId], references: [id])
+
+  @@map("orderItems")
+}
+
+enum Status {
+  PENDING
+  PAYMENT_PROCESSING
+  PAID
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model ProcessedEvent {
+  id          Int      @id @default(autoincrement())
+  eventId     String   @unique
+  topic       String
+  processedAt DateTime @default(now())
+
+  @@map("processedEvents")
+}
+
+model OutboxEvent {
+  id          Int       @id @default(autoincrement())
+  eventId     String    @unique
+  eventType   String
+  topic       String
+  payload     Json
+  publishedAt DateTime?
+
+  @@map("outboxEvents")
+}
