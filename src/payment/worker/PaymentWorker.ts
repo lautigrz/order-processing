@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleDestroy } from "@nestjs/common";
+import { Inject, Injectable, Logger, OnModuleDestroy } from "@nestjs/common";
 import { Worker } from "bullmq";
 import { PaymentService } from "../PaymentService.js";
 import { dqueue, enqueuePaymentDLQ } from "../queue/payment.queue.js";
@@ -7,10 +7,13 @@ import { ObjectFailed } from "../types/payment.types.js";
 @Injectable()
 export class PaymentWorker implements OnModuleDestroy {
     private readonly logger = new Logger(PaymentWorker.name);
-    private worker: Worker;
+    private paymentWorker: Worker;
+    private refundWorker: Worker;
 
-    constructor(private readonly paymentService: PaymentService) {
-        this.worker = new Worker('payment-retry', async (job) => {
+    constructor(
+        @Inject(PaymentService)
+        private readonly paymentService: PaymentService) {
+        this.paymentWorker = new Worker('payment-retry', async (job) => {
             this.logger.debug(`Processing job ${job.id} — event ${job.data.eventId}`);
             await this.paymentService.processPayment(job.data);
         }, {
@@ -22,7 +25,22 @@ export class PaymentWorker implements OnModuleDestroy {
             lockDuration: 60000
         });
 
-        this.worker.on('failed', async (job, err) => {
+        this.refundWorker = new Worker('payment-refund', async (job) => {
+            this.logger.debug(`Processing job ${job.id} — event ${job.data.eventId}`);
+            await this.paymentService.processRefundPayment(job.data);
+        }, {
+            connection: {
+                host: process.env.REDIS_HOST ?? 'localhost',
+                port: Number(process.env.REDIS_PORT ?? 6379),
+            },
+            concurrency: 10,
+            lockDuration: 60000
+        });
+
+
+
+
+        this.paymentWorker.on('failed', async (job, err) => {
             this.logger.warn(`Job ${job?.id} failed — attempt ${job?.attemptsMade}/${job?.opts.attempts}: ${err.message}`);
 
             if (job?.attemptsMade! >= job?.opts.attempts!) {
@@ -44,10 +62,9 @@ export class PaymentWorker implements OnModuleDestroy {
             }
         });
 
-        this.worker.on('completed', async (job) => {
+        this.paymentWorker.on('completed', async (job) => {
             this.logger.debug(`Job ${job.id} completed`);
 
-            // Solo consultamos Redis si el job fue explícitamente reencolado desde la DLQ
             if (job.data.isFromDLQ) {
                 const dlqJob = await dqueue.getJob(job.data.eventId);
                 if (dlqJob) {
@@ -60,6 +77,7 @@ export class PaymentWorker implements OnModuleDestroy {
 
     async onModuleDestroy() {
         this.logger.log('Closing worker...');
-        await this.worker.close();
+        await this.refundWorker.close();
+        await this.paymentWorker.close();
     }
 }

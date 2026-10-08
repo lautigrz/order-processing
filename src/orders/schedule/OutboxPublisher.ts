@@ -28,7 +28,7 @@ export class OutboxPublisher {
     private isProcessing = false;
 
     constructor(
-        private readonly prisma: PrismaService,
+        @Inject(PrismaService) private readonly prisma: PrismaService,
         @Inject('KAFKA_SERVICE') private readonly kafka: ClientKafka,
     ) { }
 

@@ -18,6 +18,18 @@ export const queueJob = new Queue<EventPayload>('payment-retry', {
     },
 });
 
+export const queueRefund = new Queue<EventPayload>('payment-refund', {
+    connection: redisConnection,
+    defaultJobOptions: {
+        attempts: 3,
+        backoff: {
+            type: 'exponential',
+            delay: 1000,
+        },
+    },
+});
+
+
 export const dqueue = new Queue<ObjectFailed>('payment-retry-dlq', {
     connection: redisConnection,
 });
@@ -31,7 +43,13 @@ export async function enqueuePaymentDLQ(objectFailed: ObjectFailed) {
     const job = await dqueue.add('failed-payment', objectFailed, {
         jobId: objectFailed.payload.eventId,
     });
+
     return job;
+}
+
+
+export async function enqueuePaymentRefund(data: EventPayload) {
+    await queueRefund.add('payment-refund', data);
 }
 
 export async function reprocessPayment(jobId: string) {

@@ -1,14 +1,18 @@
-import { BadRequestException, Injectable, Logger, NotFoundException } from "@nestjs/common";
+import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { PrismaService } from "../prisma/PrismaService.js";
 import { CreateOrderDto, UpdateOrderStatusDto } from "./contracts/order.schema.js";
 import { Decimal } from "@prisma/client/runtime/client";
 import { canTransition } from "./utils/status.js";
+import { PaymentStatus, ReservationStatus, Status } from "../generated/prisma/enums.js";
+import { Prisma } from "../generated/prisma/client.js";
 
 @Injectable()
 export class OrdersService {
     private readonly logger = new Logger(OrdersService.name);
 
-    constructor(private readonly prisma: PrismaService) { }
+    constructor(
+        @Inject(PrismaService)
+        private readonly prisma: PrismaService) { }
 
     async getAll() {
         return this.prisma.order.findMany({
@@ -137,5 +141,90 @@ export class OrdersService {
         }
         return order;
     }
+
+
+    async paymentSucceeded(orderId: number) {
+        await this.prisma.$transaction(async (tx) => {
+            const order = await tx.order.findUnique({
+                where: { id: orderId }
+            });
+            if (!order) throw new Error(`Order ${orderId} not found`);
+
+            if (order.status === Status.CANCELLED || order.paymentStatus === PaymentStatus.REFUNDED) {
+                return;
+            }
+
+            if (order.paymentStatus === PaymentStatus.PAID) {
+                return;
+            }
+
+            await tx.order.update({
+                where: { id: orderId },
+                data: { paymentStatus: PaymentStatus.PAID }
+            });
+
+
+            await this.tryAdvanceOrder(tx, order.id);
+        });
+    }
+
+    async reservationSucceeded(orderId: number) {
+        await this.prisma.$transaction(async (tx) => {
+            const order = await tx.order.findUnique({
+                where: { id: orderId }
+            });
+            if (!order) throw new Error(`Order ${orderId} not found`);
+
+            if (order.stockReservationStatus === ReservationStatus.RESERVED) {
+                return;
+            }
+
+            await tx.order.update({
+                where: { id: orderId },
+                data: { stockReservationStatus: ReservationStatus.RESERVED }
+            });
+
+
+            await this.tryAdvanceOrder(tx, order.id);
+
+        });
+    }
+
+    async tryAdvanceOrder(tx: Prisma.TransactionClient, orderId: number) {
+
+        const order = await tx.order.findUnique({
+            where: { id: orderId }
+        });
+        if (!order) throw new Error(`Order ${orderId} not found`);
+
+        if (order.paymentStatus === PaymentStatus.PAID &&
+            order.stockReservationStatus === ReservationStatus.RESERVED) {
+
+            await tx.order.update({
+                where: { id: orderId },
+                data: { status: Status.PROCESSING }
+            });
+        }
+    }
+
+    async paymentFailed(orderId: number) {
+        await this.prisma.order.update({
+            where: { id: orderId },
+            data: {
+                status: Status.FAILED,
+                paymentStatus: PaymentStatus.FAILED,
+            },
+        });
+    }
+
+    async stockReleased(orderId: number) {
+        await this.prisma.order.update({
+            where: { id: orderId },
+            data: {
+                stockReservationStatus: ReservationStatus.RELEASED,
+            },
+        });
+    }
+
 
 }

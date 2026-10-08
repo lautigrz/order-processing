@@ -1,17 +1,11 @@
-import { Module } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
-import { OrdersModule } from './orders/OrdersModule.js';
-import { PrismaModule } from './prisma/PrismaModule.js';
-import { PaymentModule } from './payment/PaymentModule.js';
-import { ScheduleModule } from '@nestjs/schedule';
-
-@Module({
-  imports: [
-    ConfigModule.forRoot({ isGlobal: true }),
-    PrismaModule,
-    OrdersModule,
-    PaymentModule,
-    ScheduleModule.forRoot(),
-  ],
-})
-export class AppModule { }
+/**
+ * AppModule monolítico — RETIRADO.
+ *
+ * Este módulo existía cuando Orders y Payment corrían en el mismo proceso.
+ * Fue reemplazado por:
+ *
+ *   apps/orders-service/src/OrdersAppModule.ts  → proceso 1
+ *   apps/payment-service/src/PaymentAppModule.ts → proceso 2
+ *
+ * No importar este archivo desde ningún entrypoint activo.
+ */
