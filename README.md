@@ -6,7 +6,7 @@ Sistema de procesamiento de órdenes distribuido y orientado a eventos, diseñad
 
 ## Arquitectura y Flujo de Datos
 
-El sistema resuelve el problema de la consistencia dual (escritura en base de datos y publicación a un broker de mensajería) garantizando entrega al menos una vez (at-least-once delivery) sin pérdida de mensajes ante fallas de red o caídas de servicios.
+El sistema utiliza el patrón Transactional Outbox para evitar la pérdida de eventos entre la persistencia de la orden y su publicación en Kafka. Los eventos pendientes se reintentan hasta ser publicados, dando lugar a una semántica de entrega at-least-once que se complementa con procesamiento idempotente en los consumidores.
 
 ### Diagrama de Flujo
 
@@ -22,7 +22,7 @@ Cliente HTTP
 2. OutboxPublisher (Cron cada 2s, background)
     ├── Lectura por lotes con SELECT ... FOR UPDATE SKIP LOCKED
     ├── Publicación paralela al topic 'orders' en Apache Kafka
-    └── Actualización masiva de publishedAt en PostgreSQL
+    └── Actualización masiva de publishedAt para los eventos publicados correctamente.
     │
     ▼
 3. PaymentController (Kafka Consumer Group)
@@ -54,7 +54,7 @@ Debido a que Kafka garantiza entrega al menos una vez (*at-least-once*), los con
 ### 3. Manejo de Fallos y Dead Letter Queue (DLQ)
 Si el procesamiento de pago falla:
 - BullMQ reintenta con backoff exponencial (3 intentos con incremento de retardo).
-- Al agotar los reintentos, el job se traslada automáticamente a la cola `payment-retry-dlq` con metadata del error, stacktrace y conteo de intentos.
+- Al agotar los reintentos, el worker captura el fallo y crea un nuevo job en la cola payment-retry-dlq, conservando metadata del error, stacktrace y conteo de intentos.
 - Se expone un endpoint administrativo para reprocesar manualmente los jobs de la DLQ:
   `POST /v1/api/payment/dlq/:jobId/reprocess`
 
@@ -132,7 +132,7 @@ pnpm install
 Crear un archivo `.env` en la raíz del proyecto tomando como referencia el siguiente esquema:
 
 ```env
-DATABASE_URL="postgresql://postgres:postgres@localhost:5433/order_proccesing?schema=public"
+DATABASE_URL="postgresql://postgres:postgres@localhost:5433/order_processing?schema=public"
 PORT=3000
 
 KAFKA_BROKERS="localhost:9092"
