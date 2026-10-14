@@ -1,4 +1,4 @@
-import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
+import { Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { PrismaService } from "../prisma/PrismaService.js";
 import { ReservationStatus } from "../generated/prisma/enums.js";
 import { EventPayload } from "../payment/types/payment.types.js";
@@ -102,6 +102,8 @@ export class InventoryService {
                         topic: 'orders',
                         payload: {
                             orderId: data.orderId,
+                            customerId: data.customerId,
+                            total: data.total,
                         },
                     }
                 })

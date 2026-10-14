@@ -35,6 +35,9 @@ export class OrdersController {
         } else if (data.event === "StockReleased") {
             this.logger.log(`Received StockReleased for order ${data.orderId}`);
             await this.ordersService.stockReleased(data.orderId);
+        } else if (data.event === "PaymentRefunded") {
+            this.logger.log(`Received PaymentRefunded for order ${data.orderId}`);
+            await this.ordersService.paymentRefunded(data.orderId);
         }
     }
 

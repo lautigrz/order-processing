@@ -14,9 +14,9 @@ async function clean() {
   console.log('1️⃣  Limpiando PostgreSQL...');
   try {
     const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-    await pool.query('TRUNCATE TABLE "orderItems", "orders", "processedEvents", "outboxEvents" RESTART IDENTITY CASCADE;');
+    await pool.query('TRUNCATE TABLE "orderItems", "orders", "payments", "stockReservations", "processedEvents", "outboxEvents" RESTART IDENTITY CASCADE;');
     await pool.end();
-    console.log('    ✅ Tablas orders, orderItems, processedEvents y outboxEvents truncadas (IDs en 1).');
+    console.log('    ✅ Tablas orders, orderItems, payments, stockReservations, processedEvents y outboxEvents truncadas (IDs en 1).');
   } catch (err) {
     console.error('    ❌ Error limpiando PostgreSQL:', err.message);
   }

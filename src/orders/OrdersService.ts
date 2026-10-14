@@ -226,5 +226,12 @@ export class OrdersService {
         });
     }
 
-
+    async paymentRefunded(orderId: number) {
+        await this.prisma.order.update({
+            where: { id: orderId },
+            data: {
+                paymentStatus: PaymentStatus.REFUNDED,
+            },
+        });
+    }
 }

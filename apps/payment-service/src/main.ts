@@ -12,6 +12,7 @@ async function bootstrap() {
 
   const app = await NestFactory.create(PaymentAppModule, {
     logger: logLevels,
+    rawBody: true,
   });
 
   app.connectMicroservice<MicroserviceOptions>({

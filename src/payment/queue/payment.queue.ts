@@ -35,7 +35,10 @@ export const dqueue = new Queue<ObjectFailed>('payment-retry-dlq', {
 });
 
 export async function enqueuePaymentRetry(data: EventPayload) {
-    const job = await queueJob.add('payment-retry', data);
+    const job = await queueJob.add('payment-retry', data, {
+        jobId: data.eventId,
+        removeOnComplete: true,
+    });
     return job;
 }
 
@@ -49,7 +52,11 @@ export async function enqueuePaymentDLQ(objectFailed: ObjectFailed) {
 
 
 export async function enqueuePaymentRefund(data: EventPayload) {
-    await queueRefund.add('payment-refund', data);
+    const job = await queueRefund.add('payment-refund', data, {
+        jobId: `refund-${data.eventId}`,
+        removeOnComplete: true,
+    });
+    return job;
 }
 
 export async function reprocessPayment(jobId: string) {
