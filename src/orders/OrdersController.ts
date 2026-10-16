@@ -16,7 +16,7 @@ export class OrdersController {
         },
         StockReservationFailed: async (data) => {
             this.logger.log(`Received StockReservationFailed for order #${data.orderId}`);
-            await this.ordersService.updateStatus({ status: Status.CANCELLED }, data.orderId);
+            await this.ordersService.cancelOrder(data.orderId);
         },
         PaymentSucceeded: async (data) => {
             this.logger.log(`Received PaymentSucceeded for order #${data.orderId}`);
@@ -47,7 +47,11 @@ export class OrdersController {
 
         const handler = this.eventHandlers[data?.event];
         if (handler) {
-            await handler(data);
+            try {
+                await handler(data);
+            } catch (err: any) {
+                this.logger.error(`Error processing Kafka event "${data?.event}" for order #${data?.orderId}: ${err?.message}`, err?.stack);
+            }
         } else {
             this.logger.debug(`[OrdersController] Unhandled event "${data?.event}" — skipping`);
         }

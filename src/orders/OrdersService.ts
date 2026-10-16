@@ -204,7 +204,34 @@ export class OrdersService {
         return status === Status.CANCELLED || paymentStatus === PaymentStatus.REFUNDED;
     }
 
+    async cancelOrder(orderId: number): Promise<void> {
+        const order = await this.prisma.order.findUnique({
+            where: { id: orderId },
+        });
+
+        if (!order) {
+            this.logger.warn(`Order #${orderId} not found to cancel — skipping`);
+            return;
+        }
+
+        if (order.status === Status.CANCELLED) {
+            this.logger.debug(`Order #${orderId} is already CANCELLED — skipping`);
+            return;
+        }
+
+        await this.prisma.order.update({
+            where: { id: orderId },
+            data: { status: Status.CANCELLED },
+        });
+        this.logger.log(`Order #${orderId} cancelled due to stock reservation failure`);
+    }
+
     async paymentFailed(orderId: number): Promise<void> {
+        const order = await this.prisma.order.findUnique({ where: { id: orderId } });
+        if (!order || (order.status === Status.FAILED && order.paymentStatus === PaymentStatus.FAILED)) {
+            return;
+        }
+
         await this.prisma.order.update({
             where: { id: orderId },
             data: {
@@ -215,6 +242,11 @@ export class OrdersService {
     }
 
     async stockReleased(orderId: number): Promise<void> {
+        const order = await this.prisma.order.findUnique({ where: { id: orderId } });
+        if (!order || order.stockReservationStatus === ReservationStatus.RELEASED) {
+            return;
+        }
+
         await this.prisma.order.update({
             where: { id: orderId },
             data: {
@@ -224,6 +256,11 @@ export class OrdersService {
     }
 
     async paymentRefunded(orderId: number): Promise<void> {
+        const order = await this.prisma.order.findUnique({ where: { id: orderId } });
+        if (!order || order.paymentStatus === PaymentStatus.REFUNDED) {
+            return;
+        }
+
         await this.prisma.order.update({
             where: { id: orderId },
             data: {
