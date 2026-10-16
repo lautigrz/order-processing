@@ -13,7 +13,7 @@ export function createStripeClient(configService: ConfigService): Stripe {
     }
 
     return new Stripe(secretKey, {
-        timeout: 10000, // Timeout explícito de 10s por petición HTTP a Stripe
-        maxNetworkRetries: 2, // Reintento automático a nivel de red con idempotencia interna de Stripe
+        timeout: 10000,
+        maxNetworkRetries: 2,
     });
 }
