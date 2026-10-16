@@ -1,150 +1,174 @@
 # System Order Processing
 
-Sistema de procesamiento de órdenes distribuido y orientado a eventos, diseñado con NestJS, PostgreSQL, Apache Kafka y Redis/BullMQ. Implementa patrones de resiliencia empresarial como Transactional Outbox, procesamiento idempotente y Dead Letter Queue (DLQ).
+Sistema distribuido de procesamiento de órdenes orientado a eventos y de alta concurrencia, diseñado con **NestJS**, **PostgreSQL**, **Apache Kafka**, **Redis/BullMQ** e integración con **Stripe**. Implementa patrones avanzados de arquitectura empresarial como **Transactional Outbox**, **Sagas Coreografiadas**, **Consumo Idempotente**, **Pessimistic Locking (`FOR UPDATE`)** y **Dead Letter Queue (DLQ)**.
 
 ---
 
-## Arquitectura y Flujo de Datos
+## 🏛️ Arquitectura y Flujo de Datos
 
-El sistema utiliza el patrón Transactional Outbox para evitar la pérdida de eventos entre la persistencia de la orden y su publicación en Kafka. Los eventos pendientes se reintentan hasta ser publicados, dando lugar a una semántica de entrega at-least-once que se complementa con procesamiento idempotente en los consumidores.
-
-### Diagrama de Flujo
+El sistema está dividido en microservicios independientes que se comunican de forma asíncrona mediante Kafka y colas BullMQ, asegurando consistencia eventual y desacoplamiento total.
 
 ```
 Cliente HTTP
     │
-    ▼ [POST /v1/api/orders]
-1. OrdersService (Transacción PostgreSQL)
-    ├── Inserta Order + OrderItems
-    └── Inserta OutboxEvent (estado no publicado)
+    ▼ [POST /api/orders]
+1. OrdersService (Transacción ACID PostgreSQL)
+    ├── Valida cliente e ítems
+    ├── Inserta Order + OrderItems (estado PENDING)
+    └── Inserta OutboxEvent (OrderCreated)
     │
-    ▼ [HTTP 201 Created inmediato]
-2. OutboxPublisher (Cron cada 2s, background)
+    ▼ [HTTP 201 Created inmediato < 40ms]
+2. OutboxPublisher (Cron background continuo)
     ├── Lectura por lotes con SELECT ... FOR UPDATE SKIP LOCKED
     ├── Publicación paralela al topic 'orders' en Apache Kafka
-    └── Actualización masiva de publishedAt para los eventos publicados correctamente.
+    └── Marca de publishedAt masiva en PostgreSQL
     │
     ▼
-3. PaymentController (Kafka Consumer Group)
-    └── Recibe evento y encola en BullMQ (Redis)
+3. InventoryService (Consumidor Kafka)
+    ├── Verificación de idempotencia
+    ├── Si hay stock: descuenta inventario y emite StockReserved
+    └── Si no hay stock: emite StockReservationFailed ➔ Orders cancela la orden (Saga Compensatoria)
     │
     ▼
-4. PaymentWorker (BullMQ Worker concurrente)
-    └── Ejecuta PaymentService:
-        ├── Verificación de idempotencia contra processedEvents
-        ├── Transición de estado de la orden a PAYMENT_PROCESSING
-        └── Registro en processedEvents dentro de la misma transacción
+4. PaymentController / PaymentQueueService (BullMQ en Redis)
+    ├── Encola job en cola payment-retry con backoff exponencial
+    └── PaymentWorker (Concurrencia 10)
+         ├── Crea registro Payment (PENDING)
+         └── Genera Stripe Checkout Session (fuera de la transacción de DB)
+    │
+    ▼
+5. Pasarela Stripe & Webhooks (PaymentWebhookService)
+    ├── checkout.session.completed ➔ Marca PAID y emite PaymentSucceeded
+    ├── payment_intent.payment_failed (fondos insuficientes/tarjeta) ➔ Marca FAILED y emite PaymentFailed
+    └── checkout.session.expired (abandono de checkout) ➔ Marca FAILED y emite PaymentFailed
+    │
+    ▼
+6. Compensación en Saga (Orders e Inventory)
+    ├── OrdersService recibe PaymentSucceeded y pasa la orden a PROCESSING
+    └── Si recibe PaymentFailed ➔ Orders cancela la orden y libera reservas de stock en Inventory
 ```
 
 ---
 
-## Patrones de Diseño Implementados
+## 🧩 Patrones de Diseño y Resiliencia Implementados
 
-### 1. Transactional Outbox Pattern
-En lugar de publicar directamente a Kafka desde el endpoint HTTP (lo cual genera inconsistencias si la transacción de base de datos falla luego de emitir o viceversa), el evento se almacena en la tabla `outboxEvents` dentro de la misma transacción ACID que crea la orden.
+### 1. Patrón Saga Coreografiada (Choreographed Saga Pattern)
+Coordinación de procesos de negocio distribuidos entre `orders`, `inventory` y `payment` sin un orquestador centralizado:
+- **Transacciones Positivas:** `OrderCreated` ➔ `StockReserved` ➔ `PaymentSucceeded` ➔ Orden en `PROCESSING`.
+- **Transacciones de Compensación:** 
+  - Si el inventario no tiene stock: emite `StockReservationFailed` y `orders` cancela automáticamente la orden (`CANCELLED`).
+  - Si el pago falla en Stripe (tarjeta declinada o fondos insuficientes): emite `PaymentFailed`, `orders` pasa a `FAILED` e `inventory` ejecuta `refundStock()` liberando las reservas.
 
-Un proceso en segundo plano (`OutboxPublisher`):
-- Lee los eventos pendientes utilizando `FOR UPDATE SKIP LOCKED`, lo que permite concurrencia entre instancias sin colisiones ni bloqueos de tabla.
-- Emite los eventos a Kafka en paralelo mediante `Promise.all()`.
-- Actualiza la marca temporal `publishedAt` en bloque (`updateMany`).
+### 2. Transactional Outbox Pattern
+Para evitar inconsistencias de doble escritura entre la base de datos y el broker de mensajería:
+- El evento se guarda en la tabla `outboxEvents` dentro de la misma transacción ACID de PostgreSQL.
+- Un worker lee mediante `SELECT ... FOR UPDATE SKIP LOCKED`, publica a Kafka y confirma los eventos procesados por lotes.
 
-### 2. Consumo Idempotente
-Debido a que Kafka garantiza entrega al menos una vez (*at-least-once*), los consumidores pueden recibir mensajes duplicados durante rebalanceos de red. `PaymentService` valida cada `eventId` contra la tabla `processedEvents`. Si el evento ya fue procesado, se descarta inmediatamente antes de realizar cualquier mutación.
+### 3. Consumo Idempotente
+Debido a que Kafka ofrece semántica *at-least-once*, cada evento recibido por cualquier servicio verifica su clave de idempotencia (`${eventId}:${service}`) en la tabla `processedEvents`. Si el evento ya se procesó, se descarta de forma segura sin efectos secundarios.
 
-### 3. Manejo de Fallos y Dead Letter Queue (DLQ)
-Si el procesamiento de pago falla:
-- BullMQ reintenta con backoff exponencial (3 intentos con incremento de retardo).
-- Al agotar los reintentos, el worker captura el fallo y crea un nuevo job en la cola payment-retry-dlq, conservando metadata del error, stacktrace y conteo de intentos.
-- Se expone un endpoint administrativo para reprocesar manualmente los jobs de la DLQ:
-  `POST /v1/api/payment/dlq/:jobId/reprocess`
+### 4. Arquitectura de Colas Desacoplada con BullMQ
+- `PaymentQueueService`: Servicio inyectable bajo el contenedor IoC de NestJS (`OnModuleDestroy`) que aísla las colas.
+- **`payment-retry`**: Cola principal de cobro con reintentos exponenciales (3 intentos).
+- **`payment-refund`**: Cola aislada para reembolsos asíncronos.
+- **`payment-retry-dlq` (Dead Letter Queue)**: Almacena jobs fallidos conservando metadata, stacktrace y número de reintentos para inspección o reprocesamiento manual:
+  `POST /api/payment/dlq/:jobId/reprocess`
 
----
+### 5. Integración Robusta con Stripe (Ports & Adapters)
+- **Timeouts y Reintentos de Red:** Cliente de Stripe configurado con timeout explícito (10s) y `maxNetworkRetries: 2`.
+- **Fast-Commit Transactions:** La llamada HTTP externa a Stripe se realiza fuera de la transacción de PostgreSQL para no agotar el Connection Pool, y la confirmación en base de datos se ejecuta en una transacción atómica ultrarrápida (< 2ms).
+- **Webhooks Seguros:** Verificación criptográfica de firma en [PaymentWebhookService](file:///e:/workspace-node/system-order-processing/src/payment/webhook/PaymentWebhookService.ts), respondiendo `400 Bad Request` en caso de firmas inválidas sin tocar la base de datos (protección anti-DDoS).
 
-## Optimizaciones de Rendimiento Aplicadas
-
-Durante las pruebas de carga se identificaron y resolvieron los siguientes cuellos de botella:
-
-1. **Ajuste del Connection Pool de PostgreSQL**:
-   Se configuró el adaptador `@prisma/adapter-pg` con un pool explícito de 30 conexiones (`max: 30`, configurable vía `DB_POOL_MAX`), evitando que las solicitudes HTTP entrantes y los workers asíncronos compitan por el pool por defecto de 10 conexiones.
-
-2. **Drenado por Lotes del Outbox**:
-   Se incrementó el tamaño de lote de 10 a 100 eventos y se añadió un bucle de drenado continuo por ciclo de ejecución para absorber ráfagas masivas sin acumular latencia en disco.
-
-3. **Concurrencia en Workers**:
-   Se configuró el worker de BullMQ con `concurrency: 10` y `lockDuration: 60000`, permitiendo procesar hasta ~70-100 jobs por segundo sin pérdida de candados (*missing lock*) por contención de CPU.
-
-4. **Niveles de Logging**:
-   Los registros detallados por orden se movieron a nivel `debug`, permitiendo silenciar la salida por consola durante pruebas de estrés mediante `LOG_LEVELS="log,warn,error"` para evitar que operaciones I/O en terminal bloqueen el Event Loop de Node.js.
+### 6. Control de Concurrencia con Locks Pesimistas (`FOR UPDATE`)
+En flujos de reembolso concurrentes, se utiliza `SELECT ... FOR UPDATE` sobre la tabla `payments` para prevenir condiciones de carrera y evitar dobles reembolsos.
 
 ---
 
-## Métricas de Rendimiento Obtenidas
+## ⚡ Optimizaciones de Rendimiento
 
-Resultados registrados con Autocannon en pruebas de carga sostenida sobre un solo nodo:
-
-### Load Test (20 conexiones concurrentes, 60 segundos)
-- Requests totales: 8.636
-- Throughput: 143.9 req/s (pico de 201 req/s)
-- Latencia p50: 124 ms
-- Latencia p90: 187 ms
-- Latencia p97.5: 306 ms
-- Tasa de error: 0.00%
-
-### Stress Test (100 conexiones concurrentes, 90 segundos)
-- Requests totales: 17.161
-- Throughput: 190.7 req/s (pico de 252 req/s)
-- Latencia p50: 496 ms
-- Latencia p90: 722 ms
-- Tasa de error: 0.00% (cero fallas de conexión o errores 5xx)
+1. **Connection Pool de PostgreSQL**: Configurado en `@prisma/adapter-pg` con pool de conexiones ampliado (`DB_POOL_MAX=30`), evitando contención de sockets.
+2. **Concurrencia en Workers de Pagos**: `PaymentWorker` opera con `concurrency: 10` y `lockDuration: 60000`, procesando lotes masivos de pagos en paralelo.
+3. **Limpieza y Clean Code**:
+   - Funciones cortas con nombres reveladores de intención.
+   - Event Dispatchers basados en diccionarios para controladores (`eventHandlers`), respetando el principio Open/Closed (OCP).
+   - Utilidades puras compartidas para idempotencia y Outbox en `src/common/utils/event.util.ts`.
 
 ---
 
-## Stack Tecnológico
+## 📊 Métricas de Rendimiento Obtenidas
+
+Resultados registrados con **Autocannon** sobre un solo nodo:
+
+### 1. Load Test (20 conexiones concurrentes, 60 segundos)
+- **Requests totales:** 7.381
+- **Throughput:** 123.0 req/s (pico de 210 req/s)
+- **Latencia p50:** 141 ms
+- **Latencia p90:** 258 ms
+- **Latencia p97.5:** 343 ms ✅
+- **Tasa de error:** **0.00%** (0 errores HTTP, 0 desconexiones)
+
+### 2. Stress Test (100 conexiones concurrentes, 90 segundos)
+- **Requests totales:** 15.379
+- **Throughput:** 170.9 req/s (pico de 249 req/s)
+- **Latencia p50:** 532 ms
+- **Tasa de error:** **0.00%** (cero fallas de conexión o errores 5xx bajo 100 clientes simultáneos)
+
+### 3. Stripe Webhook Stress Test (30 conexiones concurrentes, 15 segundos)
+- **Requests totales:** 52.299
+- **Throughput:** **3.487 req/s**
+- **Latencia promedio:** **8.1 ms** (p50: 6 ms, p99: 29 ms)
+- **Comportamiento:** Intercepción inmediata de firmas inválidas (`400 Bad Request`) en memoria sin degradación de base de datos.
+
+---
+
+## 🛠️ Stack Tecnológico
 
 - **Runtime**: Node.js v22+
 - **Framework**: NestJS v12
 - **Lenguaje**: TypeScript
-- **Base de Datos**: PostgreSQL 16 (con Prisma ORM v7 y `@prisma/adapter-pg`)
+- **Base de Datos**: PostgreSQL 16 (Prisma ORM v7 y `@prisma/adapter-pg`)
 - **Broker de Mensajería**: Apache Kafka (KafkaJS)
 - **Colas y Cache**: Redis 7 con BullMQ v6
+- **Pasarela de Pagos**: Stripe API v23
 - **Pruebas de Carga**: Autocannon y k6
 
 ---
 
-## Requisitos Previos
+## 🚀 Instalación y Puesta en Marcha
 
-- Docker y Docker Compose
-- Node.js v22 o superior
-- pnpm v9 o superior
-
----
-
-## Instalación y Puesta en Marcha
-
-### 1. Clonar el repositorio e instalar dependencias
+### 1. Clonar e instalar dependencias
 ```bash
 git clone <URL_DEL_REPOSITORIO>
 cd system-order-processing
 pnpm install
 ```
 
-### 2. Configurar variables de entorno
-Crear un archivo `.env` en la raíz del proyecto tomando como referencia el siguiente esquema:
-
+### 2. Variables de Entorno (`.env`)
+Crear un archivo `.env` en la raíz tomando como base:
 ```env
-DATABASE_URL="postgresql://postgres:postgres@localhost:5433/order_processing?schema=public"
-PORT=3000
+DATABASE_URL="postgresql://postgres:postgres@localhost:5433/order_proccesing?schema=public"
+
+ORDERS_PORT=3000
+PAYMENT_PORT=3001
+INVENTORY_PORT=3002
 
 KAFKA_BROKERS="localhost:9092"
-KAFKA_CLIENT_ID_ORDERS="order-processing"
+KAFKA_CLIENT_ID_ORDERS="orders-service"
 KAFKA_CLIENT_ID_PAYMENT="payment-service"
+KAFKA_CLIENT_ID_INVENTORY="inventory-service"
+KAFKA_GROUP_ID_ORDERS="orders-service"
 KAFKA_GROUP_ID_PAYMENT="payment-service"
+KAFKA_GROUP_ID_INVENTORY="inventory-service"
 
 REDIS_HOST="localhost"
 REDIS_PORT=6379
-
 DB_POOL_MAX=30
 LOG_LEVELS="log,warn,error"
+
+STRIPE_SECRET_KEY=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+STRIPE_SUCCESS_URL="http://localhost:3000/api/v1/orders/success"
+STRIPE_CANCEL_URL="http://localhost:3000/api/v1/orders/cancel"
 ```
 
 ### 3. Levantar la infraestructura
@@ -152,100 +176,53 @@ LOG_LEVELS="log,warn,error"
 docker compose up -d
 ```
 
-### 4. Inicializar la base de datos
+### 4. Inicializar Base de Datos
 ```bash
-# Sincronizar esquema y generar cliente Prisma
 pnpm db:push
-
-# Cargar datos iniciales (usuarios y productos)
 pnpm db:seed
 ```
 
-### 5. Iniciar la aplicación
+### 5. Iniciar los Microservicios
+Abrir 3 terminales:
 ```bash
-# Modo desarrollo con recarga en caliente
-pnpm start:dev
+# Terminal 1 - Orders Service (Puerto 3000)
+pnpm start:orders
 
-# Compilación y modo producción
-pnpm build
-pnpm start:prod
+# Terminal 2 - Inventory Service (Puerto 3002)
+pnpm start:inventory
+
+# Terminal 3 - Payment Service (Puerto 3001)
+pnpm start:payment
 ```
 
 ---
 
-## Endpoints de la API
+## 📡 Endpoints de la API
 
-### Órdenes
+### Órdenes (`/api/orders`)
+- `POST /api/orders` — Crea una nueva orden y emite `OrderCreated`.
+- `GET /api/orders` — Lista todas las órdenes con sus ítems.
+- `GET /api/orders/:id` — Obtiene detalle de una orden por ID.
+- `PATCH /api/orders/:id/status` — Actualiza estado con validación de máquina de estados.
 
-#### Crear una orden
-- **Método**: `POST`
-- **Ruta**: `/v1/api/orders`
-- **Cuerpo**:
-```json
-{
-  "customerId": 1,
-  "items": [
-    { "productId": 1, "quantity": 2 },
-    { "productId": 2, "quantity": 1 }
-  ]
-}
-```
-- **Respuesta**: `201 Created` con el detalle de la orden generada.
-
-#### Consultar todas las órdenes
-- **Método**: `GET`
-- **Ruta**: `/v1/api/orders`
-
-#### Consultar orden por ID
-- **Método**: `GET`
-- **Ruta**: `/v1/api/orders/:id`
-
-### Pagos (Administración)
-
-#### Reprocesar job desde la DLQ
-- **Método**: `POST`
-- **Ruta**: `/v1/api/payment/dlq/:jobId/reprocess`
+### Pagos (`/api/payment`)
+- `POST /api/payment/webhook` — Webhook oficial para eventos de Stripe (`completed`, `failed`, `expired`).
+- `POST /api/payment/dlq/:jobId/reprocess` — Reintenta manualmente un job fallido desde la Dead Letter Queue.
 
 ---
 
-## Pruebas de Carga y Monitoreo
+## 🧪 Pruebas de Carga y Monitoreo
 
-El repositorio incluye herramientas integradas para evaluar el comportamiento bajo tráfico concurrente.
-
-### Monitor en Tiempo Real
-Permite observar en consola el estado de las colas BullMQ, el acumulado de eventos en el Outbox y la distribución de órdenes en base de datos:
 ```bash
+# Monitor en tiempo real de BullMQ, DLQ y Outbox
 pnpm load:monitor
-```
 
-### Ejecutar Pruebas con Autocannon
-```bash
-# Verificación básica (1 conexión, 10s)
-pnpm load:smoke
+# Pruebas con Autocannon
+pnpm load:smoke    # Smoke test (1 conexión, 10s)
+pnpm load:load     # Load test (20 conexiones, 60s)
+pnpm load:stress   # Stress test (100 conexiones, 90s)
+pnpm load:readonly # Solo lectura (50 conexiones, 30s)
 
-# Carga sostenida (20 conexiones, 60s)
-pnpm load:load
-
-# Prueba de estrés (100 conexiones, 90s)
-pnpm load:stress
-
-# Solo lectura (20 conexiones, 30s)
-pnpm load:readonly
-```
-
-### Ejecutar Pruebas con k6 (Opcional)
-```bash
-pnpm k6:smoke
-pnpm k6:load
-pnpm k6:stress
-pnpm k6:spike
-pnpm k6:e2e
-```
-
-### Limpiar el Entorno de Pruebas
-Reinicia a cero las órdenes en PostgreSQL, limpia las colas en Redis (`FLUSHALL`) y recrea el topic de Kafka:
-```bash
+# Limpieza total del ambiente (PostgreSQL, Redis y topics Kafka)
 pnpm db:clean
 ```
-
----

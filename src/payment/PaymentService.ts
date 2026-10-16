@@ -2,9 +2,17 @@ import { Inject, Injectable, Logger } from "@nestjs/common";
 import { PrismaService } from "../prisma/PrismaService.js";
 import { PaymentStatus } from "../generated/prisma/enums.js";
 import { EventPayload } from "./types/payment.types.js";
-import { enqueuePaymentRefund, enqueuePaymentRetry, reprocessPayment } from "./queue/payment.queue.js";
+import { PaymentQueueService } from "./queue/PaymentQueueService.js";
 import { StripeService } from "./stripe/StripeService.js";
+import { emitOutboxEvent, isEventProcessed, markEventProcessed } from "./utils/payment.util.js";
+import { Prisma } from "../generated/prisma/client.js";
 import Stripe from "stripe";
+
+interface LockedPaymentRecord {
+    id: number;
+    status: PaymentStatus;
+    amount: any;
+}
 
 @Injectable()
 export class PaymentService {
@@ -12,55 +20,68 @@ export class PaymentService {
 
     constructor(
         @Inject(PrismaService)
-        private prisma: PrismaService,
+        private readonly prisma: PrismaService,
         @Inject(StripeService)
-        private stripeService: StripeService,
+        private readonly stripeService: StripeService,
+        @Inject(PaymentQueueService)
+        private readonly paymentQueueService: PaymentQueueService,
     ) { }
 
-    async processPayment(data: EventPayload) {
+    async processPayment(data: EventPayload): Promise<void> {
         this.logger.debug(`Processing payment for event ${data.eventId}`);
-
         const idempotencyKey = `${data.eventId}:payment`;
 
-        // 1. Verificar idempotencia de evento
-        const processExist = await this.prisma.processedEvent.findUnique({
-            where: { eventId: idempotencyKey },
-        });
-        if (processExist) {
+        if (await isEventProcessed(this.prisma, idempotencyKey)) {
             this.logger.warn(`Event ${data.eventId} already processed — skipping`);
             return;
         }
 
-        // 2. Verificar estado en el dominio propio de Payments (sin consultar tabla orders)
+        const shouldSkip = await this.shouldSkipPaymentCreation(data, idempotencyKey);
+        if (shouldSkip) return;
+
+        const payment = await this.createPendingPaymentRecord(data);
+
+        let session: Stripe.Checkout.Session;
+        try {
+            session = await this.createStripeCheckoutSession(payment.id, data);
+        } catch (error: any) {
+            this.logger.error(`[Stripe] Failed to create checkout session for order #${data.orderId}: ${error?.message}`);
+            await this.prisma.payment.update({
+                where: { id: payment.id },
+                data: { status: PaymentStatus.FAILED },
+            });
+            throw error;
+        }
+
+        await this.prisma.$transaction(async (tx) => {
+            await this.attachSessionToPayment(payment.id, session, tx);
+            await markEventProcessed(tx, idempotencyKey);
+        });
+
+        this.logger.log(`[Stripe] Checkout Session creada para orden #${data.orderId}: ${session.url}`);
+    }
+
+    private async shouldSkipPaymentCreation(data: EventPayload, idempotencyKey: string): Promise<boolean> {
         const existingPayment = await this.prisma.payment.findFirst({
             where: { orderId: data.orderId },
         });
 
         if (existingPayment?.status === PaymentStatus.REFUNDED || existingPayment?.status === PaymentStatus.PAID) {
             this.logger.warn(`Payment for order ${data.orderId} is already ${existingPayment.status} — skipping charge`);
-            await this.prisma.processedEvent.create({
-                data: {
-                    eventId: idempotencyKey,
-                    topic: 'orders',
-                },
-            });
-            return;
+            await markEventProcessed(this.prisma, idempotencyKey);
+            return true;
         }
 
         if (existingPayment?.checkoutUrl) {
             this.logger.log(`[Stripe] Checkout Session already exists for order ${data.orderId}: ${existingPayment.checkoutUrl}`);
-            return;
+            return true;
         }
 
-        // Simular error de pasarela (para testing de reintentos BullMQ y DLQ)
-        const simulateGatewayError = false;
-        if (simulateGatewayError) {
-            this.logger.error(`Error connecting to Payment Gateway (Timeout)`);
-            throw new Error("Payment Gateway Timeout (504)");
-        }
+        return false;
+    }
 
-        // 3. Crear registro Payment PENDING usando datos que viajaron en el evento (Event-Carried State Transfer)
-        const payment = await this.prisma.payment.create({
+    private async createPendingPaymentRecord(data: EventPayload) {
+        return this.prisma.payment.create({
             data: {
                 orderId: data.orderId,
                 amount: data.total,
@@ -68,106 +89,87 @@ export class PaymentService {
                 status: PaymentStatus.PENDING,
             },
         });
+    }
 
-        // 4. Crear Stripe Checkout Session
-        const session = await this.stripeService.createCheckoutSession({
-            paymentId: payment.id,
+    private async createStripeCheckoutSession(paymentId: number, data: EventPayload): Promise<Stripe.Checkout.Session> {
+        return this.stripeService.createCheckoutSession({
+            paymentId,
             orderId: data.orderId,
             customerId: data.customerId,
             amount: Math.round(Number(data.total) * 100),
             currency: 'usd',
         });
+    }
 
-        // 5. Guardar la URL y session ID en el pago
-        await this.prisma.payment.update({
-            where: { id: payment.id },
+    private async attachSessionToPayment(
+        paymentId: number,
+        session: Stripe.Checkout.Session,
+        client: Prisma.TransactionClient | PrismaService = this.prisma,
+    ): Promise<void> {
+        await client.payment.update({
+            where: { id: paymentId },
             data: {
                 stripeCheckoutSessionId: session.id,
                 checkoutUrl: session.url,
             },
         });
-
-        // 6. Registrar evento como procesado en la tabla de idempotencia
-        try {
-            await this.prisma.processedEvent.create({
-                data: {
-                    eventId: idempotencyKey,
-                    topic: 'orders',
-                },
-            });
-        } catch (err: any) {
-            if (err?.code !== 'P2002') {
-                throw err;
-            }
-        }
-
-        this.logger.log(`\n========================================================================\n💳 [Stripe] Checkout Session creada para orden #${data.orderId}!\n👉 URL de pago: ${session.url}\n========================================================================\n`);
     }
 
-    async handleRefundRequest(data: EventPayload) {
+    async handleRefundRequest(data: EventPayload): Promise<void> {
         this.logger.log(`Refund requested for order ${data.orderId}`);
+
         await this.prisma.$transaction(async (tx) => {
             const idempotencyKey = `${data.eventId}:payment-refund-req`;
-            const processExist = await tx.processedEvent.findUnique({
-                where: { eventId: idempotencyKey },
-            });
-            if (processExist) {
+            if (await isEventProcessed(tx, idempotencyKey)) {
                 this.logger.warn(`Event ${data.eventId} already processed — skipping`);
                 return;
             }
 
-            // Consultar exclusivamente la tabla de pagos con lock
-            const paymentList = await tx.$queryRaw<{ id: number; status: PaymentStatus; amount: any }[]>`
-                SELECT id, status, amount
-                FROM "payments"
-                WHERE "orderId" = ${data.orderId}
-                FOR UPDATE
-            `;
-            const payment = paymentList[0];
-
+            const payment = await this.findPaymentForUpdate(tx, data.orderId);
             if (!payment) {
                 this.logger.log(`No payment record found for order ${data.orderId} — nothing to refund`);
             } else if (payment.status === PaymentStatus.PAID) {
-                this.logger.log(`Payment for order ${data.orderId} is PAID, enqueuing refund`);
-                await tx.payment.update({
-                    where: { id: payment.id },
-                    data: { status: PaymentStatus.REFUNDING_PENDING },
-                });
-                await tx.outboxEvent.create({
-                    data: {
-                        eventId: crypto.randomUUID(),
-                        eventType: 'RefundPending',
-                        topic: 'orders',
-                        payload: {
-                            orderId: data.orderId,
-                        },
-                    },
-                });
+                await this.applyPaidRefund(tx, payment.id, data.orderId);
             } else if (payment.status === PaymentStatus.PENDING) {
-                this.logger.log(`Payment for order ${data.orderId} was PENDING, setting REFUNDED`);
-                await tx.payment.update({
-                    where: { id: payment.id },
-                    data: { status: PaymentStatus.REFUNDED },
-                });
+                await this.applyPendingRefund(tx, payment.id, data.orderId);
             }
 
-            await tx.processedEvent.create({
-                data: {
-                    eventId: idempotencyKey,
-                    topic: 'orders',
-                },
-            });
+            await markEventProcessed(tx, idempotencyKey);
         });
     }
 
-    async processRefundPayment(data: EventPayload) {
+    private async findPaymentForUpdate(tx: Prisma.TransactionClient, orderId: number): Promise<LockedPaymentRecord | undefined> {
+        const paymentList = await tx.$queryRaw<LockedPaymentRecord[]>`
+            SELECT id, status, amount
+            FROM "payments"
+            WHERE "orderId" = ${orderId}
+            FOR UPDATE
+        `;
+        return paymentList[0];
+    }
+
+    private async applyPaidRefund(tx: Prisma.TransactionClient, paymentId: number, orderId: number): Promise<void> {
+        this.logger.log(`Payment for order ${orderId} is PAID, enqueuing refund`);
+        await tx.payment.update({
+            where: { id: paymentId },
+            data: { status: PaymentStatus.REFUNDING_PENDING },
+        });
+
+        await emitOutboxEvent(tx, 'RefundPending', { orderId });
+    }
+
+    private async applyPendingRefund(tx: Prisma.TransactionClient, paymentId: number, orderId: number): Promise<void> {
+        this.logger.log(`Payment for order ${orderId} was PENDING, setting REFUNDED`);
+        await tx.payment.update({
+            where: { id: paymentId },
+            data: { status: PaymentStatus.REFUNDED },
+        });
+    }
+
+    async processRefundPayment(data: EventPayload): Promise<void> {
         await this.prisma.$transaction(async (tx) => {
             const idempotencyKey = `${data.eventId}:payment-refund-proc`;
-            const processExist = await tx.processedEvent.findUnique({
-                where: { eventId: idempotencyKey },
-            });
-
-            if (processExist) {
+            if (await isEventProcessed(tx, idempotencyKey)) {
                 this.logger.warn(`Event ${data.eventId} already processed — skipping`);
                 return;
             }
@@ -182,101 +184,49 @@ export class PaymentService {
             }
 
             if (payment.stripePaymentIntentId) {
-                try {
-                    await this.stripeService.createRefund({
-                        paymentIntentId: payment.stripePaymentIntentId,
-                    });
-                    this.logger.log(`[Stripe] Refund successful for PaymentIntent ${payment.stripePaymentIntentId}`);
-                } catch (stripeErr: any) {
-                    this.logger.warn(`[Stripe] Warning creating refund: ${stripeErr?.message}`);
-                }
+                await this.executeStripeRefund(payment.stripePaymentIntentId);
             }
 
-            await tx.payment.update({
-                where: { id: payment.id },
-                data: { status: PaymentStatus.REFUNDED },
-            });
-
-            this.logger.log(`Processing refund payment for order ${data.orderId}`);
-
-            // Emitir evento PaymentRefunded para que OrdersService actualice su orden
-            await tx.outboxEvent.create({
-                data: {
-                    eventId: crypto.randomUUID(),
-                    eventType: 'PaymentRefunded',
-                    topic: 'orders',
-                    payload: {
-                        orderId: data.orderId,
-                    },
-                },
-            });
-
-            await tx.processedEvent.create({
-                data: {
-                    eventId: idempotencyKey,
-                    topic: 'orders',
-                },
-            });
+            await this.finalizeRefund(tx, payment.id, data.orderId);
+            await markEventProcessed(tx, idempotencyKey);
         });
     }
 
-    async handleWebhook(rawBody: Buffer, signature: string) {
-        const event = this.stripeService.constructWebhookEvent(rawBody, signature);
-        this.logger.log(`[Stripe Webhook] Event received: ${event.type}`);
-
-        if (event.type === 'checkout.session.completed') {
-            const session = event.data.object as Stripe.Checkout.Session;
-            const orderId = Number(session.metadata?.orderId ?? session.client_reference_id);
-            const paymentId = session.metadata?.paymentId ? Number(session.metadata.paymentId) : undefined;
-            const customerId = session.metadata?.customerId ? Number(session.metadata.customerId) : 0;
-            const paymentIntentId = typeof session.payment_intent === 'string'
-                ? session.payment_intent
-                : session.payment_intent?.id;
-
-            this.logger.log(`[Stripe Webhook] Checkout completed for order ${orderId}`);
-
-            await this.prisma.$transaction(async (tx) => {
-                const payment = paymentId
-                    ? await tx.payment.findUnique({ where: { id: paymentId } })
-                    : await tx.payment.findFirst({ where: { orderId } });
-
-                if (payment) {
-                    await tx.payment.update({
-                        where: { id: payment.id },
-                        data: {
-                            status: PaymentStatus.PAID,
-                            stripePaymentIntentId: paymentIntentId ?? null,
-                        },
-                    });
-                }
-                await tx.outboxEvent.create({
-                    data: {
-                        eventId: crypto.randomUUID(),
-                        eventType: 'PaymentSucceeded',
-                        topic: 'orders',
-                        payload: {
-                            orderId,
-                            customerId,
-                            total: payment?.amount ? String(payment.amount) : String(session.amount_total ? session.amount_total / 100 : 0),
-                        },
-                    },
-                });
-            });
+    private async executeStripeRefund(paymentIntentId: string): Promise<void> {
+        try {
+            await this.stripeService.createRefund({ paymentIntentId });
+            this.logger.log(`[Stripe] Refund successful for PaymentIntent ${paymentIntentId}`);
+        } catch (stripeErr: any) {
+            this.logger.error(`[Stripe] Error creating refund for PaymentIntent ${paymentIntentId}: ${stripeErr?.message}`);
+            throw stripeErr;
         }
-
-        return { received: true };
     }
 
-    async refundEnqueue(data: EventPayload) {
-        await enqueuePaymentRefund(data);
+    private async finalizeRefund(tx: Prisma.TransactionClient, paymentId: number, orderId: number): Promise<void> {
+        await tx.payment.update({
+            where: { id: paymentId },
+            data: { status: PaymentStatus.REFUNDED },
+        });
+
+        this.logger.log(`Processing refund payment for order ${orderId}`);
+        await emitOutboxEvent(tx, 'PaymentRefunded', { orderId });
     }
 
-    async enqueuePaymentProcess(data: EventPayload) {
+
+    // =========================================================================
+    // Queue Enqueue Methods
+    // =========================================================================
+
+    async enqueuePaymentProcess(data: EventPayload): Promise<void> {
         this.logger.debug(`Enqueuing event ${data.eventId} for order ${data.orderId}`);
-        await enqueuePaymentRetry(data);
+        await this.paymentQueueService.enqueuePaymentRetry(data);
     }
 
-    async reprocessEvent(jobId: string) {
-        await reprocessPayment(jobId);
+    async refundEnqueue(data: EventPayload): Promise<void> {
+        await this.paymentQueueService.enqueuePaymentRefund(data);
+    }
+
+    async reprocessEvent(jobId: string): Promise<void> {
+        await this.paymentQueueService.reprocessPayment(jobId);
     }
 }

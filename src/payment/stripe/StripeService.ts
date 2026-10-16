@@ -1,26 +1,18 @@
-
-import { Inject, Injectable } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, Logger } from '@nestjs/common';
 import Stripe from 'stripe';
 import { ConfigService } from '@nestjs/config';
+import { STRIPE_CLIENT } from './client.stripe.js';
 
 @Injectable()
 export class StripeService {
-    private readonly stripe: Stripe;
+    private readonly logger = new Logger(StripeService.name);
 
     constructor(
+        @Inject(STRIPE_CLIENT)
+        private readonly stripe: Stripe,
         @Inject(ConfigService)
-        private readonly configService: ConfigService
-    ) {
-        const secretKey =
-            this.configService?.get<string>('STRIPE_SECRET_KEY') ??
-            process.env.STRIPE_SECRET_KEY;
-
-        if (!secretKey) {
-            throw new Error('STRIPE_SECRET_KEY is not configured in environment');
-        }
-
-        this.stripe = new Stripe(secretKey);
-    }
+        private readonly configService: ConfigService,
+    ) { }
 
     async createCheckoutSession(params: {
         paymentId: number;
@@ -84,11 +76,16 @@ export class StripeService {
             throw new Error('STRIPE_WEBHOOK_SECRET is not configured');
         }
 
-        return this.stripe.webhooks.constructEvent(
-            rawBody,
-            signature,
-            webhookSecret,
-        );
+        try {
+            return this.stripe.webhooks.constructEvent(
+                rawBody,
+                signature,
+                webhookSecret,
+            );
+        } catch (err: any) {
+            this.logger.error(`[Stripe Webhook] Invalid signature: ${err?.message}`);
+            throw new BadRequestException(`Invalid Stripe signature: ${err?.message}`);
+        }
     }
 
     async createRefund(params: {

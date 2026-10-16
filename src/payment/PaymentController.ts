@@ -2,6 +2,7 @@ import { BadRequestException, Controller, Headers, Inject, Logger, Param, Post, 
 import type { RawBodyRequest } from "@nestjs/common";
 import { EventPattern, Payload } from "@nestjs/microservices";
 import { PaymentService } from "./PaymentService.js";
+import { PaymentWebhookService } from "./webhook/PaymentWebhookService.js";
 import type { EventPayload } from "./types/payment.types.js";
 import type { Request } from "express";
 
@@ -9,22 +10,28 @@ import type { Request } from "express";
 export class PaymentController {
     private readonly logger = new Logger(PaymentController.name);
 
+    private readonly eventHandlers: Record<string, (data: EventPayload) => Promise<void>> = {
+        'StockReserved': (data) => this.paymentService.enqueuePaymentProcess(data),
+        'StockReservationFailed': (data) => this.paymentService.handleRefundRequest(data),
+        'RefundPending': (data) => this.paymentService.refundEnqueue(data),
+    };
+
     constructor(
         @Inject(PaymentService)
-        private readonly paymentService: PaymentService) { }
+        private readonly paymentService: PaymentService,
+        @Inject(PaymentWebhookService)
+        private readonly webhookService: PaymentWebhookService,
+    ) { }
 
     @EventPattern("orders")
     async handleOrderEvents(@Payload() data: EventPayload) {
-        this.logger.log(`[PaymentController] Received Kafka event ${JSON.stringify(data)}`);
-        if (data.event === 'StockReserved') {
-            this.logger.log(`[PaymentController] Received Kafka StockReserved for order ${data.orderId} — proceeding to payment`);
-            await this.paymentService.enqueuePaymentProcess(data);
-        } else if (data.event === 'StockReservationFailed') {
-            this.logger.log(`[PaymentController] Received Kafka StockReservationFailed for order ${data.orderId}`);
-            await this.paymentService.handleRefundRequest(data);
-        } else if (data.event === 'RefundPending') {
-            this.logger.log(`[PaymentController] Received Kafka RefundPending for order ${data.orderId}`);
-            await this.paymentService.refundEnqueue(data);
+        this.logger.log(`[PaymentController] Received Kafka event "${data?.event}" for order ${data?.orderId}`);
+
+        const handler = this.eventHandlers[data?.event];
+        if (handler) {
+            await handler(data);
+        } else {
+            this.logger.debug(`[PaymentController] No handler registered for event "${data?.event}" — skipping`);
         }
     }
 
@@ -39,7 +46,7 @@ export class PaymentController {
         if (!signature) {
             throw new BadRequestException('Stripe signature header is missing');
         }
-        return this.paymentService.handleWebhook(req.rawBody, signature);
+        return this.webhookService.handleWebhook(req.rawBody, signature);
     }
 
     @Post('dlq/:jobId/reprocess')
